@@ -1,0 +1,9 @@
+version: "3.8"
+
+services:
+  mcp-webresearch:
+    build: .
+    container_name: mcp-webresearch
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

@@ -1,0 +1,33 @@
+{
+  "name": "@damameet14/mcp-websearch",
+  "version": "0.1.0",
+  "description": "MCP server for web research",
+  "license": "MIT",
+  "author": "damameet14",
+  "type": "module",
+  "bin": {
+    "mcp-server-webresearch": "index.js"
+  },
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "playwright install chromium"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "web-research",
+    "ai",
+    "web-scraping"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.0.1",
+    "playwright": "^1.49.0",
+    "turndown": "^7.1.2"
+  }
+}
