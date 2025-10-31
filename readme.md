@@ -101,6 +101,18 @@ make run # Note that you will have to start the searxng instance everytime you w
 
 I am working on making "no docker" setup too a one command setup. But for now, I recommend going with Docker or go through this tiring process.
 
+## 🔧 Cline MCP Configuration (for manual setup)
+
+Once the container is running, edit your **`mcp_settings.json`**:
+
+```json
+"mcpServers": {
+  "webresearch": {
+    "command": "node",
+    "args": ["<path_to>/mcp-webresearch/index.js"]
+  }
+}
+```
 ---
 
 ## 🧠 How It Works
