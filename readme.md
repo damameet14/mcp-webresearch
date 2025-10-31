@@ -12,6 +12,12 @@ This project provides both **manual** and **Docker** installation options for de
 * 🐳 One-command Docker setup (runs MCP + SearxNG together)
 * 🧩 Supports JSON search results for easy AI processing
 
+## Newly added features
+
+* Now you can save the screenshots in your permanent memory. Just tell your AI to save the screen shot permanently.
+* You can ask the AI to list the screenshots. This will give you the path at which the screenshots are saved. 
+* More features are incoming...
+
 ---
 
 ## 🧰 Prerequisites
@@ -59,8 +65,7 @@ Once the container is running, edit your **`mcp_settings.json`**:
 "mcpServers": {
   "webresearch": {
     "command": "docker",
-    "args": ["exec", "-i", "mcp-webresearch", "node", "/app/index.js"],
-    "autoApprove": ["search_web", "visit_page", "take_screenshot"]
+    "args": ["exec", "-i", "mcp-webresearch", "node", "/app/index.js"]
   }
 }
 ```

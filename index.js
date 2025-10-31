@@ -28,6 +28,12 @@ chromium.use(StealthPlugin());
 // Initialize temp directory for screenshots
 const SCREENSHOTS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-screenshots-'));
 
+// Initialize permanent screenshots directory
+const PERMANENT_SCREENSHOTS_DIR = path.join(process.cwd(), 'permanent_screenshots');
+if (!fs.existsSync(PERMANENT_SCREENSHOTS_DIR)) {
+    fs.mkdirSync(PERMANENT_SCREENSHOTS_DIR, { recursive: true });
+}
+
 // Initialize Turndown service for converting HTML to Markdown
 // Configure with specific formatting preferences
 const turndownService = new TurndownService({
@@ -118,7 +124,93 @@ async function saveScreenshot(screenshot, title) {
     return filepath;
 }
 
-// Cleanup function to remove all screenshots from disk
+// Save screenshot permanently
+async function saveScreenshotPermanently(screenshotPath, title) {
+    try {
+        // Read the temporary screenshot
+        const screenshotData = await fs.promises.readFile(screenshotPath);
+        
+        // Generate a safe filename for permanent storage
+        const timestamp = new Date().getTime();
+        const safeTitle = title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        const filename = `${safeTitle}-${timestamp}-permanent.png`;
+        const permanentPath = path.join(PERMANENT_SCREENSHOTS_DIR, filename);
+        
+        // Save to permanent location
+        await fs.promises.writeFile(permanentPath, screenshotData);
+        
+        // Return metadata about the permanent screenshot
+        return {
+            path: permanentPath,
+            filename: filename,
+            title: title,
+            timestamp: new Date().toISOString(),
+            size: screenshotData.length
+        };
+    } catch (error) {
+        throw new Error(`Failed to save screenshot permanently: ${error.message}`);
+    }
+}
+
+// List all permanent screenshots
+async function listPermanentScreenshots() {
+    try {
+        const files = await fs.promises.readdir(PERMANENT_SCREENSHOTS_DIR);
+        const screenshots = [];
+        
+        for (const file of files) {
+            if (file.endsWith('.png')) {
+                const filePath = path.join(PERMANENT_SCREENSHOTS_DIR, file);
+                const stats = await fs.promises.stat(filePath);
+                
+                // Extract title from filename (everything before the timestamp)
+                const titleMatch = file.match(/^(.+?)-(\d+)(?:-permanent)?\.png$/);
+                const title = titleMatch ? titleMatch[1].replace(/_/g, ' ') : file;
+                
+                screenshots.push({
+                    filename: file,
+                    title: title,
+                    path: filePath,
+                    size: stats.size,
+                    createdAt: stats.birthtime.toISOString()
+                });
+            }
+        }
+        
+        return screenshots.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    } catch (error) {
+        throw new Error(`Failed to list permanent screenshots: ${error.message}`);
+    }
+}
+
+// Read a permanent screenshot
+async function readPermanentScreenshot(filename) {
+    try {
+        const filePath = path.join(PERMANENT_SCREENSHOTS_DIR, filename);
+        
+        // Verify file exists and is in the permanent screenshots directory
+        const resolvedPath = path.resolve(filePath);
+        const permanentDir = path.resolve(PERMANENT_SCREENSHOTS_DIR);
+        
+        if (!resolvedPath.startsWith(permanentDir)) {
+            throw new Error('Invalid file path');
+        }
+        
+        if (!fs.existsSync(filePath)) {
+            throw new Error('Screenshot not found');
+        }
+        
+        // Read the binary data and convert to base64
+        const screenshotData = await fs.promises.readFile(filePath);
+        const base64Data = screenshotData.toString('base64');
+        
+        return base64Data;
+    } catch (error) {
+        throw new Error(`Failed to read permanent screenshot: ${error.message}`);
+    }
+}
+
+// Cleanup function to remove all temporary screenshots from disk
 async function cleanupScreenshots() {
     try {
         // Remove all files in the screenshots directory
@@ -155,6 +247,7 @@ const TOOLS = [
             properties: {
                 url: { type: "string", description: "URL to visit" },
                 takeScreenshot: { type: "boolean", description: "Whether to take a screenshot" },
+                savePermanently: { type: "boolean", description: "Whether to save screenshot permanently" },
                 cookies: { 
                     type: "array", 
                     items: {
@@ -181,7 +274,39 @@ const TOOLS = [
         description: "Take a screenshot of the current page",
         inputSchema: {
             type: "object",
-            properties: {},  // No parameters needed
+            properties: {
+                savePermanently: { type: "boolean", description: "Whether to save screenshot permanently" }
+            },
+        },
+    },
+    {
+        name: "save_screenshot_permanently",
+        description: "Save a screenshot from current session permanently",
+        inputSchema: {
+            type: "object",
+            properties: {
+                index: { type: "number", description: "Index of screenshot in current session to save permanently" }
+            },
+            required: ["index"],
+        },
+    },
+    {
+        name: "list_permanent_screenshots",
+        description: "List all permanently saved screenshots",
+        inputSchema: {
+            type: "object",
+            properties: {},
+        },
+    },
+    {
+        name: "read_permanent_screenshot",
+        description: "Read a specific permanent screenshot",
+        inputSchema: {
+            type: "object",
+            properties: {
+                filename: { type: "string", description: "Filename of the permanent screenshot to read" }
+            },
+            required: ["filename"],
         },
     },
 ];
@@ -778,7 +903,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Handle webpage visit and content extraction
         case "visit_page": {
             // Extract URL, screenshot flag, and cookies from request
-            const { url, takeScreenshot, cookies } = request.params.arguments;
+            const { url, takeScreenshot, savePermanently, cookies } = request.params.arguments;
 
             // Step 1: Validate URL format and security
             if (!isValidUrl(url)) {
@@ -842,6 +967,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             const screenshot = await takeScreenshotWithSizeLimit(page);
                             pageResult.screenshotPath = await saveScreenshot(screenshot, title);
 
+                            // Save permanently if requested
+                            let permanentInfo = null;
+                            if (savePermanently) {
+                                permanentInfo = await saveScreenshotPermanently(pageResult.screenshotPath, title);
+                                pageResult.permanentPath = permanentInfo.path;
+                            }
+
                             // Get the index for the resource URI
                             const resultIndex = currentSession ? currentSession.results.length : 0;
                             screenshotUri = `research://screenshots/${resultIndex}`;
@@ -866,7 +998,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                                 title: result.pageResult.title,
                                 content: result.pageResult.content,
                                 timestamp: result.pageResult.timestamp,
-                                screenshot: result.screenshotUri ? `View screenshot via *MCP Resources* (Paperclip icon) @ URI: ${result.screenshotUri}` : undefined
+                                screenshot: result.screenshotUri ? `View screenshot via *MCP Resources* (Paperclip icon) @ URI: ${result.screenshotUri}` : undefined,
+                                permanent: savePermanently && permanentInfo ? `Screenshot saved permanently as: ${permanentInfo.filename} at ${permanentInfo.path}` : savePermanently ? "Screenshot saved permanently" : undefined
                             }, null, 2)
                         }]
                     };
@@ -931,6 +1064,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Handle standalone screenshot requests
         case "take_screenshot": {
+            // Extract savePermanently flag from request
+            const { savePermanently } = request.params.arguments || {};
+
             // Create a fresh context for the screenshot
             let context;
             try {
@@ -964,15 +1100,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     // Step 4: Save screenshot to disk
                     const screenshotPath = await saveScreenshot(screenshot, pageTitle || 'untitled');
 
+                    // Save permanently if requested
+                    let permanentInfo = null;
+                    if (savePermanently) {
+                        permanentInfo = await saveScreenshotPermanently(screenshotPath, pageTitle || 'untitled');
+                    }
+
                     // Step 5: Create and store screenshot result
                     const resultIndex = currentSession ? currentSession.results.length : 0;
-                    addResult({
+                    const resultData = {
                         url: pageUrl,
                         title: pageTitle || "Untitled Page",  // Fallback title if none available
                         content: "Screenshot taken",          // Simple content description
                         timestamp: new Date().toISOString(),  // Capture time
                         screenshotPath                        // Path to screenshot file
-                    });
+                    };
+                    
+                    if (permanentInfo) {
+                        resultData.permanentPath = permanentInfo.path;
+                    }
+                    
+                    addResult(resultData);
 
                     // Step 6: Notify clients about new screenshot resource
                     server.notification({
@@ -981,10 +1129,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                     // Step 7: Return success message with resource URI
                     const resourceUri = `research://screenshots/${resultIndex}`;
+                    const responseText = {
+                        message: `Screenshot taken successfully. You can view it via *MCP Resources* (Paperclip icon) @ URI: ${resourceUri}`,
+                        permanent: permanentInfo ? `Screenshot also saved permanently as: ${permanentInfo.filename} at ${permanentInfo.path}` : undefined
+                    };
+                    
                     return {
                         content: [{
                             type: "text",
-                            text: `Screenshot taken successfully. You can view it via *MCP Resources* (Paperclip icon) @ URI: ${resourceUri}`
+                            text: JSON.stringify(responseText, null, 2)
                         }]
                     };
                 } finally {
@@ -1002,6 +1155,128 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     content: [{
                         type: "text",
                         text: `Failed to take screenshot: ${error.message}`
+                    }],
+                    isError: true
+                };
+            }
+        }
+
+        // Handle save screenshot permanently requests
+        case "save_screenshot_permanently": {
+            const { index } = request.params.arguments;
+
+            try {
+                // Verify session exists
+                if (!currentSession) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: "No active research session"
+                        }],
+                        isError: true
+                    };
+                }
+
+                // Verify index is within bounds
+                if (isNaN(index) || index < 0 || index >= currentSession.results.length) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Screenshot index out of bounds: ${index}`
+                        }],
+                        isError: true
+                    };
+                }
+
+                // Get result containing screenshot
+                const result = currentSession.results[index];
+                if (!result?.screenshotPath) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `No screenshot available at index: ${index}`
+                        }],
+                        isError: true
+                    };
+                }
+
+                // Save screenshot permanently
+                const permanentInfo = await saveScreenshotPermanently(result.screenshotPath, result.title);
+                
+                // Update the result with permanent path
+                result.permanentPath = permanentInfo.path;
+                
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            message: "Screenshot saved permanently",
+                            filename: permanentInfo.filename,
+                            title: permanentInfo.title,
+                            size: permanentInfo.size,
+                            timestamp: permanentInfo.timestamp,
+                            path: permanentInfo.path
+                        }, null, 2)
+                    }]
+                };
+            } catch (error) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Failed to save screenshot permanently: ${error.message}`
+                    }],
+                    isError: true
+                };
+            }
+        }
+
+        // Handle list permanent screenshots requests
+        case "list_permanent_screenshots": {
+            try {
+                const screenshots = await listPermanentScreenshots();
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify(screenshots, null, 2)
+                    }]
+                };
+            } catch (error) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Failed to list permanent screenshots: ${error.message}`
+                    }],
+                    isError: true
+                };
+            }
+        }
+
+        // Handle read permanent screenshot requests
+        case "read_permanent_screenshot": {
+            const { filename } = request.params.arguments;
+
+            try {
+                const base64Data = await readPermanentScreenshot(filename);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            filename: filename,
+                            size: base64Data.length,
+                            message: "Screenshot data retrieved successfully. Use MCP Resources to view the image."
+                        }, null, 2)
+                    }],
+                    resources: [{
+                        uri: `permanent://screenshots/${filename}`,
+                        mimeType: "image/png",
+                        blob: base64Data
+                    }]
+                };
+            } catch (error) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Failed to read permanent screenshot: ${error.message}`
                     }],
                     isError: true
                 };
