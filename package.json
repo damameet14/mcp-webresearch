@@ -26,8 +26,11 @@
     "web-scraping"
   ],
   "dependencies": {
+    "@extra/recaptcha": "^4.2.1-next.587",
     "@modelcontextprotocol/sdk": "1.0.1",
     "playwright": "^1.49.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "turndown": "^7.1.2"
   }
 }

@@ -15,11 +15,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // Web scraping and content processing dependencies
-import { chromium } from 'playwright';
+import { chromium } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import TurndownService from "turndown";
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+
+// Use stealth plugin to avoid bot detection
+chromium.use(StealthPlugin());
 
 // Initialize temp directory for screenshots
 const SCREENSHOTS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-screenshots-'));
@@ -63,6 +67,29 @@ turndownService.addRule('preserveImages', {
         return src ? `![${alt}](${src})` : '';
     }
 });
+
+// Helper function to inject cookies into context
+async function injectCookiesIntoContext(context, cookies) {
+    try {
+        if (cookies && Array.isArray(cookies) && cookies.length > 0) {
+            // Map cookies to Playwright cookie shape
+            const playwrightCookies = cookies.map(cookie => ({
+                name: cookie.name,
+                value: cookie.value,
+                domain: cookie.domain,
+                path: cookie.path || '/',
+                expires: cookie.expires || -1,
+                httpOnly: cookie.httpOnly || false,
+                secure: cookie.secure || false,
+                sameSite: cookie.sameSite || 'Lax'
+            }));
+            
+            await context.addCookies(playwrightCookies);
+        }
+    } catch (error) {
+        throw new Error(`Failed to inject cookies: ${error.message}`);
+    }
+}
 
 // Screenshot management functions
 async function saveScreenshot(screenshot, title) {
@@ -128,6 +155,23 @@ const TOOLS = [
             properties: {
                 url: { type: "string", description: "URL to visit" },
                 takeScreenshot: { type: "boolean", description: "Whether to take a screenshot" },
+                cookies: { 
+                    type: "array", 
+                    items: {
+                        type: "object",
+                        properties: {
+                            name: { type: "string" },
+                            value: { type: "string" },
+                            domain: { type: "string" },
+                            path: { type: "string" },
+                            httpOnly: { type: "boolean" },
+                            secure: { type: "boolean" },
+                            expires: { type: "number" }
+                        },
+                        required: ["name", "value", "domain"]
+                    },
+                    description: "Optional array of cookies to inject into the browser context" 
+                }
             },
             required: ["url"],
         },
@@ -213,10 +257,15 @@ function addResult(result) {
 // Safe page navigation with error handling and bot detection
 async function safePageNavigation(page, url) {
     try {
+        // Set realistic headers
+        await page.setExtraHTTPHeaders({ 
+            'Accept-Language': 'en-US,en;q=0.9' 
+        });
+
         // Step 1: Initial navigation
         const response = await page.goto(url, {
             waitUntil: 'domcontentloaded',
-            timeout: 15000
+            timeout: 20000
         });
 
         // Step 2: Basic response validation
@@ -232,10 +281,10 @@ async function safePageNavigation(page, url) {
 
         // Step 3: Wait for network to become idle or timeout
         await Promise.race([
-            page.waitForLoadState('networkidle', { timeout: 5000 })
+            page.waitForLoadState('networkidle', { timeout: 10000 })
                 .catch(() => {/* ignore timeout */ }),
             // Fallback timeout in case networkidle never occurs
-            new Promise(resolve => setTimeout(resolve, 5000))
+            new Promise(resolve => setTimeout(resolve, 10000))
         ]);
 
         // Step 4: Security and content validation
@@ -245,7 +294,9 @@ async function safePageNavigation(page, url) {
                 '#cf-challenge-running',  // Cloudflare
                 '#px-captcha',            // PerimeterX
                 '#ddos-protection',       // Various
-                '#waf-challenge-html'     // Various WAFs
+                '#waf-challenge-html',    // Various WAFs
+                '.captcha-container',     // Generic captcha
+                '.bot-detection'          // Generic bot detection
             ].some(selector => document.querySelector(selector));
 
             // Check for suspicious page titles
@@ -254,7 +305,12 @@ async function safePageNavigation(page, url) {
                 'ddos protection',
                 'please wait',
                 'just a moment',
-                'attention required'
+                'attention required',
+                'access denied',
+                'blocked',
+                'forbidden',
+                'unauthorized',
+                'challenge'
             ].some(phrase => document.title.toLowerCase().includes(phrase));
 
             // Count words in the page content
@@ -288,6 +344,27 @@ async function safePageNavigation(page, url) {
     } catch (error) {
         // If an error occurs during navigation, throw an error with the URL and the error message
         throw new Error(`Navigation to ${url} failed: ${error.message}`);
+    }
+}
+
+// Try text fallback using Jina AI reader
+async function tryTextFallback(url) {
+    try {
+        const jinaUrl = `https://r.jina.ai/${url}`;
+        const response = await fetch(jinaUrl, {
+            headers: {
+                'User-Agent': process.env.MCP_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        });
+        
+        if (response.ok) {
+            const text = await response.text();
+            return text;
+        }
+        return null;
+    } catch (error) {
+        console.error('Text fallback failed:', error);
+        return null;
     }
 }
 
@@ -638,9 +715,6 @@ function isValidUrl(urlString) {
 
 // Tool request handler for executing research operations
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    // Initialize browser for tool operations
-    const page = await ensureBrowser();
-
     switch (request.params.name) {
         // Handle web search operations using Searxng
         case "search_web": {
@@ -703,8 +777,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Handle webpage visit and content extraction
         case "visit_page": {
-            // Extract URL and screenshot flag from request
-            const { url, takeScreenshot } = request.params.arguments;
+            // Extract URL, screenshot flag, and cookies from request
+            const { url, takeScreenshot, cookies } = request.params.arguments;
 
             // Step 1: Validate URL format and security
             if (!isValidUrl(url)) {
@@ -717,73 +791,133 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 };
             }
 
+            // Create a fresh browser context for this visit
+            let context;
             try {
-                // Step 2: Visit page and extract content with retry mechanism
-                const result = await withRetry(async () => {
-                    // Navigate to target URL safely
-                    await safePageNavigation(page, url);
-                    const title = await page.title();
+                context = await browser.newContext({
+                    userAgent: process.env.MCP_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    locale: 'en-US'
+                });
+                
+                // Inject cookies if provided
+                if (cookies) {
+                    await injectCookiesIntoContext(context, cookies);
+                }
+                
+                const page = await context.newPage();
+                
+                try {
+                    // Step 2: Visit page and extract content with retry mechanism
+                    const result = await withRetry(async () => {
+                        // Navigate to target URL safely
+                        await safePageNavigation(page, url);
+                        const title = await page.title();
 
-                    // Step 3: Extract and process page content
-                    const content = await withRetry(async () => {
-                        // Convert page content to markdown
-                        const extractedContent = await extractContentAsMarkdown(page);
+                        // Step 3: Extract and process page content
+                        const content = await withRetry(async () => {
+                            // Convert page content to markdown
+                            const extractedContent = await extractContentAsMarkdown(page);
 
-                        // If no content is extracted, throw an error
-                        if (!extractedContent) {
-                            throw new Error('Failed to extract content');
+                            // If no content is extracted, throw an error
+                            if (!extractedContent) {
+                                throw new Error('Failed to extract content');
+                            }
+
+                            // Return the extracted content
+                            return extractedContent;
+                        });
+
+                        // Step 4: Create result object with page data
+                        const pageResult = {
+                            url,      // Original URL
+                            title,    // Page title
+                            content,  // Markdown content
+                            timestamp: new Date().toISOString(),  // Capture time
+                        };
+
+                        // Step 5: Take screenshot if requested
+                        let screenshotUri;
+                        if (takeScreenshot) {
+                            // Capture and process screenshot
+                            const screenshot = await takeScreenshotWithSizeLimit(page);
+                            pageResult.screenshotPath = await saveScreenshot(screenshot, title);
+
+                            // Get the index for the resource URI
+                            const resultIndex = currentSession ? currentSession.results.length : 0;
+                            screenshotUri = `research://screenshots/${resultIndex}`;
+
+                            // Notify clients about new screenshot resource
+                            server.notification({
+                                method: "notifications/resources/list_changed"
+                            });
                         }
 
-                        // Return the extracted content
-                        return extractedContent;
+                        // Step 6: Store result in session
+                        addResult(pageResult);
+                        return { pageResult, screenshotUri };
                     });
 
-                    // Step 4: Create result object with page data
-                    const pageResult = {
-                        url,      // Original URL
-                        title,    // Page title
-                        content,  // Markdown content
-                        timestamp: new Date().toISOString(),  // Capture time
+                    // Step 7: Return formatted result with screenshot URI if taken
+                    const response = {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                url: result.pageResult.url,
+                                title: result.pageResult.title,
+                                content: result.pageResult.content,
+                                timestamp: result.pageResult.timestamp,
+                                screenshot: result.screenshotUri ? `View screenshot via *MCP Resources* (Paperclip icon) @ URI: ${result.screenshotUri}` : undefined
+                            }, null, 2)
+                        }]
                     };
 
-                    // Step 5: Take screenshot if requested
-                    let screenshotUri;
-                    if (takeScreenshot) {
-                        // Capture and process screenshot
-                        const screenshot = await takeScreenshotWithSizeLimit(page);
-                        pageResult.screenshotPath = await saveScreenshot(screenshot, title);
-
-                        // Get the index for the resource URI
-                        const resultIndex = currentSession ? currentSession.results.length : 0;
-                        screenshotUri = `research://screenshots/${resultIndex}`;
-
-                        // Notify clients about new screenshot resource
-                        server.notification({
-                            method: "notifications/resources/list_changed"
-                        });
+                    return response;
+                } catch (error) {
+                    // Handle bot detection and 403 errors
+                    if ((error.message.includes('403') || 
+                         error.message.includes('bot protection') || 
+                         error.message.includes('suspicious')) && 
+                        !url.includes('jina.ai')) {
+                        
+                        // Try text fallback
+                        const fallbackContent = await tryTextFallback(url);
+                        if (fallbackContent) {
+                            const pageResult = {
+                                url,
+                                title: `Fallback Content for ${url}`,
+                                content: fallbackContent,
+                                timestamp: new Date().toISOString(),
+                            };
+                            
+                            addResult(pageResult);
+                            
+                            return {
+                                content: [{
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        url: pageResult.url,
+                                        title: pageResult.title,
+                                        content: pageResult.content,
+                                        timestamp: pageResult.timestamp,
+                                        fallback: true
+                                    }, null, 2)
+                                }]
+                            };
+                        }
                     }
-
-                    // Step 6: Store result in session
-                    addResult(pageResult);
-                    return { pageResult, screenshotUri };
-                });
-
-                // Step 7: Return formatted result with screenshot URI if taken
-                const response = {
-                    content: [{
-                        type: "text",
-                        text: JSON.stringify({
-                            url: result.pageResult.url,
-                            title: result.pageResult.title,
-                            content: result.pageResult.content,
-                            timestamp: result.pageResult.timestamp,
-                            screenshot: result.screenshotUri ? `View screenshot via *MCP Resources* (Paperclip icon) @ URI: ${result.screenshotUri}` : undefined
-                        }, null, 2)
-                    }]
-                };
-
-                return response;
+                    
+                    // Re-throw error if no fallback available
+                    throw error;
+                } finally {
+                    // Always close the context to avoid leaking sessions
+                    await context.close();
+                }
             } catch (error) {
+                // Clean up context if it was created
+                if (context) {
+                    await context.close().catch(() => {});
+                }
+                
                 // Handle and format page visit errors
                 return {
                     content: [{
@@ -797,53 +931,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Handle standalone screenshot requests
         case "take_screenshot": {
+            // Create a fresh context for the screenshot
+            let context;
             try {
-                // Step 1: Capture screenshot with retry mechanism
-                const screenshot = await withRetry(async () => {
-                    // Take and optimize screenshot with default size limits
-                    return await takeScreenshotWithSizeLimit(page);
+                context = await browser.newContext({
+                    userAgent: process.env.MCP_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    locale: 'en-US'
                 });
+                
+                const page = await context.newPage();
+                
+                try {
+                    // Step 1: Capture screenshot with retry mechanism
+                    const screenshot = await withRetry(async () => {
+                        // Take and optimize screenshot with default size limits
+                        return await takeScreenshotWithSizeLimit(page);
+                    });
 
-                // Step 2: Initialize session if needed
-                if (!currentSession) {
-                    currentSession = {
-                        query: "Screenshot Session",            // Session identifier
-                        results: [],                            // Empty results array
-                        lastUpdated: new Date().toISOString(),  // Current timestamp
+                    // Step 2: Initialize session if needed
+                    if (!currentSession) {
+                        currentSession = {
+                            query: "Screenshot Session",            // Session identifier
+                            results: [],                            // Empty results array
+                            lastUpdated: new Date().toISOString(),  // Current timestamp
+                        };
+                    }
+
+                    // Step 3: Get current page information
+                    const pageUrl = await page.url();      // Current page URL
+                    const pageTitle = await page.title();  // Current page title
+
+                    // Step 4: Save screenshot to disk
+                    const screenshotPath = await saveScreenshot(screenshot, pageTitle || 'untitled');
+
+                    // Step 5: Create and store screenshot result
+                    const resultIndex = currentSession ? currentSession.results.length : 0;
+                    addResult({
+                        url: pageUrl,
+                        title: pageTitle || "Untitled Page",  // Fallback title if none available
+                        content: "Screenshot taken",          // Simple content description
+                        timestamp: new Date().toISOString(),  // Capture time
+                        screenshotPath                        // Path to screenshot file
+                    });
+
+                    // Step 6: Notify clients about new screenshot resource
+                    server.notification({
+                        method: "notifications/resources/list_changed"
+                    });
+
+                    // Step 7: Return success message with resource URI
+                    const resourceUri = `research://screenshots/${resultIndex}`;
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Screenshot taken successfully. You can view it via *MCP Resources* (Paperclip icon) @ URI: ${resourceUri}`
+                        }]
                     };
+                } finally {
+                    // Always close the context to avoid leaking sessions
+                    await context.close();
                 }
-
-                // Step 3: Get current page information
-                const pageUrl = await page.url();      // Current page URL
-                const pageTitle = await page.title();  // Current page title
-
-                // Step 4: Save screenshot to disk
-                const screenshotPath = await saveScreenshot(screenshot, pageTitle || 'untitled');
-
-                // Step 5: Create and store screenshot result
-                const resultIndex = currentSession ? currentSession.results.length : 0;
-                addResult({
-                    url: pageUrl,
-                    title: pageTitle || "Untitled Page",  // Fallback title if none available
-                    content: "Screenshot taken",          // Simple content description
-                    timestamp: new Date().toISOString(),  // Capture time
-                    screenshotPath                        // Path to screenshot file
-                });
-
-                // Step 6: Notify clients about new screenshot resource
-                server.notification({
-                    method: "notifications/resources/list_changed"
-                });
-
-                // Step 7: Return success message with resource URI
-                const resourceUri = `research://screenshots/${resultIndex}`;
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Screenshot taken successfully. You can view it via *MCP Resources* (Paperclip icon) @ URI: ${resourceUri}`
-                    }]
-                };
             } catch (error) {
+                // Clean up context if it was created
+                if (context) {
+                    await context.close().catch(() => {});
+                }
+                
                 // Handle and format screenshot errors
                 return {
                     content: [{
@@ -941,21 +1094,12 @@ async function ensureBrowser() {
     if (!browser) {
         browser = await chromium.launch({
             headless: true,  // Run in headless mode for automation
+            args: ['--no-sandbox','--disable-blink-features=AutomationControlled']
         });
-
-        // Create initial context and page
-        const context = await browser.newContext();
-        page = await context.newPage();
     }
 
-    // Create new page if current one is closed/invalid
-    if (!page) {
-        const context = await browser.newContext();
-        page = await context.newPage();
-    }
-
-    // Return the current page
-    return page;
+    // Return the browser instance
+    return browser;
 }
 
 // Cleanup function
@@ -975,6 +1119,9 @@ async function cleanup() {
         page = undefined;
     }
 }
+
+// Initialize browser on startup
+ensureBrowser().catch(console.error);
 
 // Register cleanup handlers
 process.on('exit', cleanup);
